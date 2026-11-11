@@ -172,9 +172,9 @@ python -m bulkput conflict-check
 
 Run this after both bulk put workflows finish. It reads the latest execution of each one and compares the report counts with the expected totals. It then reads all 100,000 touched keys with `BatchGetItem` and checks the `Version` of each key, group by group. It ends with `Result: matches the plan` or `Result: DOES NOT match the plan`.
 
-### Test setup 4: app traffic during a load
+### Test setup 3 with app traffic
 
-This test checks whether a load affects an application that uses the same table. Run it on new, empty tables, which is right after `cdk deploy`.
+This is the fourth 10 million-item load of test setup 3. It checks whether a load affects an application that uses the same table. Run it on new, empty tables, which is right after `cdk deploy`.
 
 ```bash
 python -m bulkput generate --count 10000000 --batch catalog-10m --shards 100
@@ -212,7 +212,7 @@ Buckets use `auto_delete_objects` and tables use `RemovalPolicy.DESTROY`, so one
 
 ## Tested
 
-us-east-1, November 2026. Test setup 1 ran with 1 million items, once on new tables and once on the same tables later. The first run was started by an S3 marker file through an EventBridge rule, which the code no longer has. The second run used `python -m bulkput start`. Test setup 2 used the commands above. Test setup 3 ran 10 million items in 100 files three times, with `generate --count 10000000 --batch catalog-10m --shards 100`. Results are in the article.
+us-east-1, November 2026. Test setup 1 ran with 1 million items, once on new tables and once on the same tables later. The first run was started by an S3 marker file through an EventBridge rule, which the code no longer has. The second run used `python -m bulkput start`. Test setup 2 used the commands above. Test setup 3 ran 10 million items in 100 files three times, with `generate --count 10000000 --batch catalog-10m --shards 100`, then a fourth time on new tables with app traffic. Results are in the article.
 
 ## Not covered
 

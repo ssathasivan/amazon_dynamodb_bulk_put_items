@@ -1,23 +1,18 @@
 # Amazon DynamoDB Bulk Put Items - A Developer's Take
 
-Loading a large batch of data into a DynamoDB table that is already serving traffic has always needed care. Until now, it meant writing a `BatchWriteItem` loader, or running a Glue or EMR job, and then handling capacity and throttling yourself.
+Loading a large batch of data into a DynamoDB table that is already serving traffic has always needed care. Until now, it meant writing a `BatchWriteItem` loader, or running a Glue or EMR job, and then handling capacity and throttling yourself. Import from S3 doesn't help here, because it only creates new tables ([AWS Database Blog](https://aws.amazon.com/blogs/database/amazon-dynamodb-can-now-import-amazon-s3-data-into-a-new-table/)).
 
-On November 5, 2026, AWS announced [bulk put items for Amazon DynamoDB](https://aws.amazon.com/about-aws/whats-new/2026/11/amazon-dynamodb-now-supports-bulk-put-items/). You point it at files in S3, and DynamoDB reads them, writes the items into an existing table, and reports what it could not write. This article explains how it works, compares it with the other options, and shares what we found when we tested it against `BatchWriteItem` with 1 million and 10 million items.
+On November 5, 2026, AWS announced [bulk put items for Amazon DynamoDB](https://aws.amazon.com/about-aws/whats-new/2026/11/amazon-dynamodb-now-supports-bulk-put-items/). You point it at files in S3, and DynamoDB reads them, writes the items into an existing table, and reports what it could not write. This article explains how it works, and shares what we found when we tested it against `BatchWriteItem` with 1 million and 10 million items, with and without app traffic on the table.
 
 The complete source, a Python app and a CDK stack, is available in the [amazon_dynamodb_bulk_put_items](https://github.com/ssathasivan/amazon_dynamodb_bulk_put_items) repository.
 
 ## How it works
 
-Bulk put items is an asynchronous operation. `StartBulkPutItems` returns an operation ARN straight away, and DynamoDB reads, checks and writes the records in the background. The writes don't use the table's capacity, so they don't compete with your application. The fourth test checks this with app traffic running during the loads.
+Bulk put items is an asynchronous operation. `StartBulkPutItems` returns an operation ARN straight away, and DynamoDB reads, checks and writes the records in the background. The writes don't use the table's capacity, so they don't compete with your application. The third test checks this with app traffic running during a load.
 
 The input is line-delimited DynamoDB JSON or [Amazon Ion](https://amazon-ion.github.io/ion-docs/), either uncompressed or compressed with gzip or zstd. Each line is one record: the item to write and, optionally, a condition. All files under one S3 prefix must use the same format and compression. The files can also be in a different account from the table.
 
-Every operation runs on one of two performance tiers:
-
-| Tier | Price (us-east-1) | Regions | Use it for |
-|---|---|---|---|
-| Standard (default) | $0.10 per GB | All commercial Regions and AWS GovCloud (US) | Loads without a deadline |
-| Accelerated | $0.20 per GB | A subset of Regions | Loads that must finish fast |
+Every operation runs on one of two performance tiers. Standard is the default, for loads without a deadline, and is in all commercial Regions and AWS GovCloud (US). Accelerated is for loads that must finish fast, is in a subset of Regions, and costs twice as much.
 
 ## Conditions
 
@@ -52,18 +47,6 @@ Use `ACCELERATED` for the Accelerated tier. If you pass a client token, a retrie
 DynamoDB writes a manifest to the output location, which says whether each input file was read in full. It also writes up to two reports: `ERROR`, for records with bad data such as a missing key, and `CONDITION_CHECK_FAILURE`, for records skipped because their condition was false. You only get the second one if you ask for it in `OutputType`.
 
 An operation ends in one of four statuses. `COMPLETED` means no record failed, though some may still have been skipped by a condition. `COMPLETED_WITH_ERRORS` means some records failed, such as a record with no key. `CANCELLED` means it was stopped on request, and the items it already wrote stay in the table. `FAILED` means it couldn't finish, and the failure code says why.
-
-## How it compares
-
-| | Bulk put items | Import from S3 | `BatchWriteItem` loader |
-|---|---|---|---|
-| Target table | Existing | New only | Existing |
-| Uses table capacity | No | No | Yes |
-| Per-record conditions | Yes | No | No |
-| Failure report | S3, with each record's position | CloudWatch Logs | Your code |
-| Price (us-east-1) | $0.10 or $0.20 per GB written | $0.15 per GB of uncompressed source data | $0.625 per million write units (on-demand) |
-
-Import from S3 only creates a new table ([AWS Database Blog](https://aws.amazon.com/blogs/database/amazon-dynamodb-can-now-import-amazon-s3-data-into-a-new-table/)), so for an existing table the choice is bulk put items or your own loader. That is what we tested.
 
 ## Sample project
 
@@ -226,7 +209,11 @@ Each report record points back to its source: the input file, the position (`ite
 
 ## Test 3: 10 million items
 
-The third test repeats the first at 10 times the size, to see whether Accelerated helps above 1 GB. It loads 10 million products, about 1 KB each, in 100 gzip files of 100,000 records, so about 10 GB in total. The records are plain writes again. We ran it three times: the first run into new, empty tables, and the next two into the same tables.
+The third test repeats the first at 10 times the size, to see whether Accelerated helps above 1 GB. It also adds app traffic, to see whether a load affects an application that uses the same table. It loads 10 million products, about 1 KB each, in 100 gzip files of 100,000 records, so about 10 GB in total. The records are plain writes again.
+
+We ran the loads three times without app traffic: first into new, empty tables, then twice into the same tables. Then we redeployed for new tables and ran a fourth load with app traffic.
+
+The app traffic comes from an `AppTraffic` Step Functions workflow, which runs a Lambda against each table in 10-minute chunks. It sends 200 `GetItem` requests per second to random products, and 50 `PutItem` requests per second to separate `app-` keys, so it never changes the loaded items. It makes one attempt per request, with no SDK retries, so every throttle is counted. Every minute it publishes the latency and the throttles to CloudWatch.
 
 This creates the files and uploads them to `s3://<InputBucketName>/batches/catalog-10m/data/`:
 
@@ -234,14 +221,23 @@ This creates the files and uploads them to `s3://<InputBucketName>/batches/catal
 python -m bulkput generate --count 10000000 --batch catalog-10m --shards 100
 ```
 
-Run this three times, and run `compare` after all three workflows finish each time:
+For the runs without app traffic, run this three times, and run `compare` after all three workflows finish each time:
 
 ```bash
 python -m bulkput start --batch catalog-10m
 python -m bulkput compare
 ```
 
-### Results
+For the run with app traffic, start the traffic on new tables and wait 10 minutes for a baseline. Then start the loads, and when they finish, compare the app's traffic in the baseline with its traffic during each load:
+
+```bash
+python -m bulkput traffic-start --minutes 180 --reads 200 --writes 50
+python -m bulkput start --batch catalog-10m
+python -m bulkput traffic-report
+python -m bulkput traffic-stop
+```
+
+### Results without app traffic
 
 Every load wrote all 10 million items.
 
@@ -265,35 +261,7 @@ Every run was faster than the one before. Standard went from over 2 hours to 23 
 
 After the first run, `describe-table` showed both bulk put tables still at 4,000 write units per second, the default for a new on-demand table, while `BatchWriteTable` had grown to 15,668. Bulk put items still got faster, so that number doesn't show its scaling.
 
-## Test 4: app traffic during a load
-
-The first three tests show that bulk put items doesn't use the table's capacity, but not that an application using the table is unaffected. The fourth test runs steady app traffic on each table while it loads.
-
-An `AppTraffic` Step Functions workflow runs a Lambda against each table in 10-minute chunks. It sends 200 `GetItem` requests per second to random products, and 50 `PutItem` requests per second to separate `app-` keys, so it never changes the loaded items. It makes one attempt per request, with no SDK retries, so every throttle is counted. Every minute it publishes the latency and the throttles to CloudWatch.
-
-We started the traffic on three new, empty tables, waited about 11 minutes for a baseline, and then started the same 10 million-item loads as in the third test, all three at once.
-
-This uploads the files and starts the traffic on all three tables:
-
-```bash
-python -m bulkput generate --count 10000000 --batch catalog-10m --shards 100
-python -m bulkput traffic-start --minutes 180 --reads 200 --writes 50
-```
-
-After 10 minutes, this starts the three loads:
-
-```bash
-python -m bulkput start --batch catalog-10m
-```
-
-After the loads finish, this compares the app's traffic in the baseline with its traffic during each load, and then stops it:
-
-```bash
-python -m bulkput traffic-report
-python -m bulkput traffic-stop
-```
-
-### Results
+### Results with app traffic
 
 | Table | Window | App requests | App write throttles | App read throttles | Read p50 | Write p50 |
 |---|---|---:|---:|---:|---:|---:|
@@ -310,9 +278,9 @@ Median latency didn't change in any window. We can't use the p99 latency: it was
 
 Each load window also had 13 to 53 errors that weren't throttles, at most 0.003% of its requests, and the baselines had none. The code didn't record the error type, so we don't know the cause.
 
-The loads took 2 h 7 min on Standard, 1 h 58 min on Accelerated and 30 min with `BatchWriteItem`, close to the first run of the third test. `BatchWriteItem` itself was throttled 1,162,742 times. The bulk put tables show about 380,000 to 410,000 write units used this time, but those are the app's own writes, not the load.
+The loads took 2 h 7 min on Standard, 1 h 58 min on Accelerated and 30 min with `BatchWriteItem`, close to the first run without app traffic. `BatchWriteItem` itself was throttled 1,162,742 times. The bulk put tables show about 380,000 to 410,000 write units used this time, but those are the app's own writes, not the load.
 
-Test 1 ran twice, test 2 once, test 3 three times and test 4 once, so these results should be treated as directional.
+Test 1 ran twice, test 2 once and test 3 four times, so these results should be treated as directional.
 
 ## Clean up
 
@@ -341,19 +309,11 @@ Assumptions:
 
 AWS doesn't say whether its GB is 1,000,000,000 or 1,073,741,824 bytes. With 1,000,000,000, the same bytes come to $1.02 and $2.05.
 
-Bulk put items is billed per GB written, not per request unit, so the cost scales with the data:
-
-| Load | Standard | Accelerated | BatchWriteItem, on-demand |
-|---|---:|---:|---:|
-| 1 million items (test 1) | about $0.10 | about $0.19 | $0.63 |
-| 10 million items (test 3) | $0.95 | $1.91 | $6.25 |
-| 100 million items | $9.54 | $19.07 | $62.50 |
-
-All rows use the same GiB basis. AWS's own example prices 100 million 1 KB items as 100 GB, at $10.00 on Standard and $20.00 on Accelerated.
+Bulk put items is billed per GB written, not per request unit, so the cost scales with the data. On the same GiB basis, 100 million 1 KB items would cost about $9.54 on Standard and $19.07 on Accelerated, against $62.50 with on-demand writes. AWS's own example prices them at $10.00 and $20.00, as 100 GB.
 
 The second test cost about $0.01 on Standard and $0.02 on Accelerated. It paid for all 100,000 valid records, not only the 60,000 written, because condition failures are billed too. The 10 records that failed validation were not billed.
 
-The fourth test cost the same as one run of the third test for the loads, plus an estimated $2 for the app traffic: about 6.5 million eventually consistent reads, 1.6 million writes, and three Lambda functions running for 3 hours.
+The run with app traffic cost the same as the other 10 million runs for the loads, plus an estimated $2 for the app traffic: about 6.5 million eventually consistent reads, 1.6 million writes, and three Lambda functions running for 3 hours.
 
 Every item is billed at a minimum of 1 KB, for the table and for each index. Above that you pay for the actual size, so a 1.1 KB item is billed as 1.1 KB, where a write unit rounds it up to 2 KB.
 
@@ -379,7 +339,7 @@ For the size limits, quotas, table states and unsupported features such as globa
 
 | Pros | Cons |
 |---|---|
-| 0 capacity used and 0 throttles in every run of tests 1 and 3, and 0 app throttles during the bulk put loads in test 4, against 1,787 during `BatchWriteItem` | 3 to 10 times slower than `BatchWriteItem` in tests 1, 3 and 4 |
+| 0 capacity used and 0 throttles in every run of tests 1 and 3, and 0 app throttles during the bulk put loads, against 1,787 during `BatchWriteItem` | 3 to 10 times slower than `BatchWriteItem` in tests 1 and 3 |
 | Conditions per record, which skipped exactly the 40,000 records they should have | Accelerated was faster only on the first 10 GB load and in the small second test, from one run each, at twice the price |
 | A report with each failed record's file and position | The first 10 million-item load took about 2 hours on Standard, against 23 to 30 minutes later |
 | About 6.6 times cheaper than on-demand writes on Standard | No condition-failure count, and reports split across folders |
