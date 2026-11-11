@@ -6,7 +6,7 @@
           operation has finished, reads the reports and writes a summary to the output bucket.
   batch   BatchWriteItem comparison: lists the input files, writes one file per invocation,
           and summarizes the run.
-  traffic Test setup 4: steady application reads and writes against one table, for up to
+  traffic Test setup 3 with app traffic: steady application reads and writes against one table, for up to
           10 minutes per invocation. The AppTraffic workflow calls it again until `until`.
 """
 from __future__ import annotations
@@ -190,7 +190,7 @@ def _summarize(event) -> dict:
     }
 
 
-# ------------------------------------------------------------- test setup 4: app traffic
+# --------------------------------------------------- test setup 3 with app traffic
 # One attempt per request: a throttled request is counted, not retried away by the SDK.
 ddb_app = boto3.client(
     "dynamodb",

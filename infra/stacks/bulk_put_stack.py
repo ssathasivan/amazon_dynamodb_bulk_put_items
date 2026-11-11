@@ -97,7 +97,7 @@ class BulkPutStack(Stack):
         start_fn = make_fn("StartFunction", "start", "Bulk put items: starts the operation", Duration.minutes(1))
         check_fn = make_fn("CheckFunction", "check", "Bulk put items: checks status, then reconciles", Duration.minutes(10))
         batch_fn = make_fn("BatchWriteFunction", "batch", "BatchWriteItem comparison load", Duration.minutes(15), 2048)
-        traffic_fn = make_fn("AppTrafficFunction", "traffic", "Test setup 4: steady app reads and writes", Duration.minutes(15), 1024)
+        traffic_fn = make_fn("AppTrafficFunction", "traffic", "Test setup 3: steady app reads and writes during a load", Duration.minutes(15), 1024)
 
         # ------------------------------------------------------------ permissions
         # StartFunction is the bulk put items caller. All five DynamoDB actions are required:
@@ -285,7 +285,7 @@ class BulkPutStack(Stack):
             timeout=Duration.hours(12),
         )
 
-        # ------------------------------------------- test setup 4: app traffic workflow
+        # --------------------------------- test setup 3 with app traffic: traffic workflow
         # Runs the traffic Lambda in 10-minute chunks until the `until` time in the input.
         traffic_chunk = tasks.LambdaInvoke(
             self,
@@ -388,13 +388,13 @@ class BulkPutStack(Stack):
 
         all_tables = (BATCH_TABLE, BULK_STANDARD_TABLE, BULK_ACCELERATED_TABLE)
         app_latency = cw.GraphWidget(
-            title="Test setup 4: app write latency p99 (ms)",
+            title="Test setup 3 with app traffic: app write latency p99 (ms)",
             left=[app_metric(t, "AppWriteLatency", "p99", t) for t in all_tables],
             width=12,
             height=8,
         )
         app_throttles = cw.GraphWidget(
-            title="Test setup 4: app requests throttled per minute",
+            title="Test setup 3 with app traffic: app requests throttled per minute",
             left=[app_metric(t, "AppWriteThrottles", "Sum", f"{t} writes") for t in all_tables]
             + [app_metric(t, "AppReadThrottles", "Sum", f"{t} reads") for t in all_tables],
             width=12,

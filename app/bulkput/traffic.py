@@ -1,4 +1,4 @@
-"""Test setup 4: steady application traffic against a table while a load runs.
+"""Test setup 3 with app traffic: steady application traffic against a table while a load runs.
 
 Each invocation sends `reads` GetItem and `writes` PutItem requests per second to one table,
 for up to `minutes` minutes, and publishes one data point per minute to CloudWatch

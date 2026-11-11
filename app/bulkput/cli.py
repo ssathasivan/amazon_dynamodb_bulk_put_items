@@ -11,7 +11,7 @@
     python -m bulkput conflict-check                                        # check the reports and the tables
     python -m bulkput cost --items 100000000 --item-bytes 1024              # offline, no AWS needed
 
-    Test setup 4 (app traffic during a load), on new tables:
+    Test setup 3 with app traffic (the fourth 10 million-item load), on new tables:
     python -m bulkput generate --count 10000000 --batch catalog-10m --shards 100
     python -m bulkput traffic-start                                         # 200 reads/s + 50 writes/s per table
     (wait 10 minutes for the baseline)
@@ -207,7 +207,7 @@ def cmd_conflict_check(args) -> None:
     print("\nResult: " + ("matches the plan" if all_ok else "DOES NOT match the plan"))
 
 
-# ------------------------------------------------------------- test setup 4: app traffic
+# --------------------------------------------------- test setup 3 with app traffic
 ALL_TABLES = [table for _, _, table in WORKFLOWS]
 
 
@@ -344,13 +344,13 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("conflict-reset", help="test setup 2: put the touched keys back to Version 1").set_defaults(fn=cmd_conflict_reset)
     sub.add_parser("conflict-check", help="test setup 2: check the reports and the tables").set_defaults(fn=cmd_conflict_check)
 
-    ts = sub.add_parser("traffic-start", help="test setup 4: start steady app traffic on all three tables")
+    ts = sub.add_parser("traffic-start", help="test setup 3 with app traffic: start steady app traffic on all three tables")
     ts.add_argument("--minutes", type=int, default=180)
     ts.add_argument("--reads", type=int, default=200)
     ts.add_argument("--writes", type=int, default=50)
     ts.set_defaults(fn=cmd_traffic_start)
-    sub.add_parser("traffic-stop", help="test setup 4: stop the app traffic").set_defaults(fn=cmd_traffic_stop)
-    sub.add_parser("traffic-report", help="test setup 4: app latency and throttles, baseline vs during each load").set_defaults(fn=cmd_traffic_report)
+    sub.add_parser("traffic-stop", help="test setup 3 with app traffic: stop the app traffic").set_defaults(fn=cmd_traffic_stop)
+    sub.add_parser("traffic-report", help="test setup 3 with app traffic: app latency and throttles, baseline vs during each load").set_defaults(fn=cmd_traffic_report)
 
     sub.add_parser("compare", help="compare the latest run of each workflow").set_defaults(fn=cmd_compare)
 
