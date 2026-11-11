@@ -97,6 +97,7 @@ class BulkPutStack(Stack):
         start_fn = make_fn("StartFunction", "start", "Bulk put items: starts the operation", Duration.minutes(1))
         check_fn = make_fn("CheckFunction", "check", "Bulk put items: checks status, then reconciles", Duration.minutes(10))
         batch_fn = make_fn("BatchWriteFunction", "batch", "BatchWriteItem comparison load", Duration.minutes(15), 2048)
+        traffic_fn = make_fn("AppTrafficFunction", "traffic", "Test setup 4: steady app reads and writes", Duration.minutes(15), 1024)
 
         # ------------------------------------------------------------ permissions
         # StartFunction is the bulk put items caller. All five DynamoDB actions are required:
@@ -143,6 +144,20 @@ class BulkPutStack(Stack):
         input_bucket.grant_read(batch_fn)
         output_bucket.grant_write(batch_fn)
         batch_table.grant_write_data(batch_fn)
+
+        traffic_fn.add_to_role_policy(
+            iam.PolicyStatement(
+                actions=["dynamodb:GetItem", "dynamodb:PutItem"],
+                resources=[t.table_arn for t in (bulk_standard_table, bulk_accelerated_table, batch_table)],
+            )
+        )
+        traffic_fn.add_to_role_policy(
+            iam.PolicyStatement(
+                actions=["cloudwatch:PutMetricData"],
+                resources=["*"],
+                conditions={"StringEquals": {"cloudwatch:namespace": "BulkPutDemo"}},
+            )
+        )
 
         # ------------------------------------------------- bulk put items workflows
         def bulk_workflow(name: str, table: str, tier: str) -> sfn.StateMachine:
@@ -270,6 +285,42 @@ class BulkPutStack(Stack):
             timeout=Duration.hours(12),
         )
 
+        # ------------------------------------------- test setup 4: app traffic workflow
+        # Runs the traffic Lambda in 10-minute chunks until the `until` time in the input.
+        traffic_chunk = tasks.LambdaInvoke(
+            self,
+            "AppTrafficRunChunk",
+            lambda_function=traffic_fn,
+            payload=sfn.TaskInput.from_object(
+                {
+                    "table": sfn.JsonPath.string_at("$.table"),
+                    "reads": sfn.JsonPath.number_at("$.reads"),
+                    "writes": sfn.JsonPath.number_at("$.writes"),
+                    "until": sfn.JsonPath.number_at("$.until"),
+                }
+            ),
+            payload_response_only=True,
+            result_path="$.last",
+        )
+        traffic_chunk.add_retry(
+            errors=["Lambda.TooManyRequestsException", "Lambda.ServiceException", "Lambda.SdkClientException"],
+            interval=Duration.seconds(5),
+            backoff_rate=2,
+            max_attempts=3,
+        )
+        traffic_loop = (
+            sfn.Choice(self, "AppTrafficContinue?")
+            .when(sfn.Condition.boolean_equals("$.last.continue", True), traffic_chunk)
+            .otherwise(sfn.Succeed(self, "AppTrafficDone"))
+        )
+        traffic_sm = sfn.StateMachine(
+            self,
+            "AppTraffic",
+            state_machine_name="AppTraffic",
+            definition_body=sfn.DefinitionBody.from_chainable(traffic_chunk.next(traffic_loop)),
+            timeout=Duration.hours(12),
+        )
+
         # -------------------------------------------------------------- dashboard
         minute = Duration.minutes(1)
 
@@ -325,12 +376,36 @@ class BulkPutStack(Stack):
             width=12,
             height=8,
         )
+        def app_metric(table: str, name: str, statistic: str, label: str) -> cw.Metric:
+            return cw.Metric(
+                namespace="BulkPutDemo",
+                metric_name=name,
+                dimensions_map={"Table": table},
+                statistic=statistic,
+                period=minute,
+                label=label,
+            )
+
+        all_tables = (BATCH_TABLE, BULK_STANDARD_TABLE, BULK_ACCELERATED_TABLE)
+        app_latency = cw.GraphWidget(
+            title="Test setup 4: app write latency p99 (ms)",
+            left=[app_metric(t, "AppWriteLatency", "p99", t) for t in all_tables],
+            width=12,
+            height=8,
+        )
+        app_throttles = cw.GraphWidget(
+            title="Test setup 4: app requests throttled per minute",
+            left=[app_metric(t, "AppWriteThrottles", "Sum", f"{t} writes") for t in all_tables]
+            + [app_metric(t, "AppReadThrottles", "Sum", f"{t} reads") for t in all_tables],
+            width=12,
+            height=8,
+        )
         dashboard = cw.Dashboard(
             self,
             "BulkPutComparison",
             dashboard_name="BulkPutComparison",
             default_interval=Duration.hours(1),
-            widgets=[[items_loaded], [capacity, throttles]],
+            widgets=[[items_loaded], [capacity, throttles], [app_latency, app_throttles]],
         )
 
         # ---------------------------------------------------------------- outputs
@@ -344,3 +419,4 @@ class BulkPutStack(Stack):
         CfnOutput(self, "BulkPutStandardArn", value=standard_sm.state_machine_arn)
         CfnOutput(self, "BulkPutAcceleratedArn", value=accelerated_sm.state_machine_arn)
         CfnOutput(self, "BatchWriteArn", value=batch_sm.state_machine_arn)
+        CfnOutput(self, "AppTrafficArn", value=traffic_sm.state_machine_arn)

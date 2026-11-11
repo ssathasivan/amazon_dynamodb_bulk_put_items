@@ -10,6 +10,14 @@
     python -m bulkput start --batch conflict-test --bulk-only               # start the 2 bulk put workflows
     python -m bulkput conflict-check                                        # check the reports and the tables
     python -m bulkput cost --items 100000000 --item-bytes 1024              # offline, no AWS needed
+
+    Test setup 4 (app traffic during a load), on new tables:
+    python -m bulkput generate --count 10000000 --batch catalog-10m --shards 100
+    python -m bulkput traffic-start                                         # 200 reads/s + 50 writes/s per table
+    (wait 10 minutes for the baseline)
+    python -m bulkput start --batch catalog-10m                             # all three loads
+    python -m bulkput traffic-report                                        # after the loads finish
+    python -m bulkput traffic-stop
 """
 from __future__ import annotations
 
@@ -199,6 +207,118 @@ def cmd_conflict_check(args) -> None:
     print("\nResult: " + ("matches the plan" if all_ok else "DOES NOT match the plan"))
 
 
+# ------------------------------------------------------------- test setup 4: app traffic
+ALL_TABLES = [table for _, _, table in WORKFLOWS]
+
+
+def cmd_traffic_start(args) -> None:
+    session = _session(args)
+    arn = _outputs(session)["AppTrafficArn"]
+    sfn = session.client("stepfunctions")
+    now = datetime.now(timezone.utc)
+    until = now.timestamp() + args.minutes * 60
+    for table in ALL_TABLES:
+        name = f"traffic-{table}-{now:%Y%m%dT%H%M%SZ}"
+        body = {"table": table, "reads": args.reads, "writes": args.writes, "until": until}
+        sfn.start_execution(stateMachineArn=arn, name=name, input=json.dumps(body))
+        print(f"Started app traffic on {table}: {args.reads} reads/s and {args.writes} writes/s for up to {args.minutes} min")
+    print(f"Traffic started at {now:%H:%M:%S} UTC. Wait at least 10 minutes for the baseline before starting a load.")
+
+
+def cmd_traffic_stop(args) -> None:
+    session = _session(args)
+    arn = _outputs(session)["AppTrafficArn"]
+    sfn = session.client("stepfunctions")
+    running = sfn.list_executions(stateMachineArn=arn, statusFilter="RUNNING")["executions"]
+    for ex in running:
+        sfn.stop_execution(executionArn=ex["executionArn"], cause="traffic-stop")
+        print(f"Stopped {ex['name']}")
+    if not running:
+        print("No app traffic running.")
+
+
+def _app_stats(cw, table: str, start: datetime, end: datetime) -> dict:
+    """One CloudWatch period that covers [start, end): percentiles from the Values/Counts data."""
+    start = (start + timedelta(minutes=1)).replace(second=0, microsecond=0)
+    period = int((end - start).total_seconds()) // 60 * 60
+    if period < 60:
+        return {}
+    end = start + timedelta(seconds=period)
+    dims = [{"Name": "Table", "Value": table}]
+    out = {"minutes": period // 60}
+    for name, key in (("AppReadLatency", "read"), ("AppWriteLatency", "write")):
+        pts = cw.get_metric_statistics(
+            Namespace="BulkPutDemo", MetricName=name, Dimensions=dims, StartTime=start, EndTime=end,
+            Period=period, ExtendedStatistics=["p50", "p99"],
+        )["Datapoints"]
+        if pts:
+            out[f"{key}_p50"] = pts[0]["ExtendedStatistics"]["p50"]
+            out[f"{key}_p99"] = pts[0]["ExtendedStatistics"]["p99"]
+    for name in ("AppReads", "AppWrites", "AppReadThrottles", "AppWriteThrottles", "AppReadErrors", "AppWriteErrors"):
+        pts = cw.get_metric_statistics(
+            Namespace="BulkPutDemo", MetricName=name, Dimensions=dims, StartTime=start, EndTime=end,
+            Period=period, Statistics=["Sum"],
+        )["Datapoints"]
+        out[name] = int(sum(p["Sum"] for p in pts))
+    return out
+
+
+def cmd_traffic_report(args) -> None:
+    """Compare the app's latency and throttles in the baseline window with the window of each load."""
+    session = _session(args)
+    outputs = _outputs(session)
+    sfn = session.client("stepfunctions")
+    cw = session.client("cloudwatch")
+
+    traffic = sfn.list_executions(stateMachineArn=outputs["AppTrafficArn"], maxResults=20)["executions"]
+    if not traffic:
+        print("No app traffic has run.")
+        return
+    traffic_start = max(ex["startDate"] for ex in traffic)
+    traffic_start = min(ex["startDate"] for ex in traffic if (traffic_start - ex["startDate"]).total_seconds() < 300)
+
+    loads = {}
+    for output_key, label, table in WORKFLOWS:
+        execs = sfn.list_executions(stateMachineArn=outputs[output_key], maxResults=5)["executions"]
+        execs = [e for e in execs if e["startDate"] > traffic_start]
+        if execs:
+            ex = sfn.describe_execution(executionArn=execs[0]["executionArn"])
+            loads[table] = (label, ex["startDate"], ex.get("stopDate") or datetime.now(timezone.utc), ex["status"])
+    if not loads:
+        print("No load has started since the traffic started.")
+        return
+    load_start = min(v[1] for v in loads.values())
+
+    def ms(row, key):
+        return f"{row[key]:.1f}" if key in row else "-"
+
+    header = ["Table", "Window", "Minutes", "Read p50", "Read p99", "Write p50", "Write p99", "Read throttles", "Write throttles", "Errors", "Requests"]
+    rows = []
+    for table in ALL_TABLES:
+        windows = [("baseline", traffic_start + timedelta(minutes=1), load_start)]
+        if table in loads:
+            label, start, stop, status = loads[table]
+            windows.append((f"during {label}", start, stop))
+        for wname, start, end in windows:
+            s = _app_stats(cw, table, start, end)
+            if not s:
+                continue
+            ok = s["AppReads"] + s["AppWrites"]
+            errors = s["AppReadErrors"] + s["AppWriteErrors"]
+            rows.append([
+                table, wname, str(s["minutes"]), ms(s, "read_p50"), ms(s, "read_p99"), ms(s, "write_p50"), ms(s, "write_p99"),
+                f"{s['AppReadThrottles']:,}", f"{s['AppWriteThrottles']:,}", f"{errors:,}",
+                f"{ok + errors + s['AppReadThrottles'] + s['AppWriteThrottles']:,}",
+            ])
+    width = [max(len(h), *(len(r[i]) for r in rows)) for i, h in enumerate(header)]
+    print("  ".join(h.ljust(width[i]) for i, h in enumerate(header)))
+    for r in rows:
+        print("  ".join(c.ljust(width[i]) for i, c in enumerate(r)))
+    print("\nLatency in milliseconds, measured by the client, one attempt per request (no SDK retries).")
+    for table, (label, start, stop, status) in loads.items():
+        print(f"{label}: {status}, {start.astimezone(timezone.utc):%H:%M:%S} to {stop.astimezone(timezone.utc):%H:%M:%S} UTC")
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="bulkput", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--profile")
@@ -223,6 +343,14 @@ def build_parser() -> argparse.ArgumentParser:
     cg.set_defaults(fn=cmd_conflict_generate)
     sub.add_parser("conflict-reset", help="test setup 2: put the touched keys back to Version 1").set_defaults(fn=cmd_conflict_reset)
     sub.add_parser("conflict-check", help="test setup 2: check the reports and the tables").set_defaults(fn=cmd_conflict_check)
+
+    ts = sub.add_parser("traffic-start", help="test setup 4: start steady app traffic on all three tables")
+    ts.add_argument("--minutes", type=int, default=180)
+    ts.add_argument("--reads", type=int, default=200)
+    ts.add_argument("--writes", type=int, default=50)
+    ts.set_defaults(fn=cmd_traffic_start)
+    sub.add_parser("traffic-stop", help="test setup 4: stop the app traffic").set_defaults(fn=cmd_traffic_stop)
+    sub.add_parser("traffic-report", help="test setup 4: app latency and throttles, baseline vs during each load").set_defaults(fn=cmd_traffic_report)
 
     sub.add_parser("compare", help="compare the latest run of each workflow").set_defaults(fn=cmd_compare)
 

@@ -6,6 +6,8 @@
           operation has finished, reads the reports and writes a summary to the output bucket.
   batch   BatchWriteItem comparison: lists the input files, writes one file per invocation,
           and summarizes the run.
+  traffic Test setup 4: steady application reads and writes against one table, for up to
+          10 minutes per invocation. The AppTraffic workflow calls it again until `until`.
 """
 from __future__ import annotations
 
@@ -21,7 +23,7 @@ import boto3
 from botocore.config import Config
 from botocore.exceptions import ClientError
 
-from . import reconcile, runner
+from . import reconcile, runner, traffic as app_traffic
 from .pricing import ON_DEMAND_PER_MILLION_WRU
 
 OUTPUT_BUCKET = os.environ.get("OUTPUT_BUCKET", "")
@@ -186,3 +188,20 @@ def _summarize(event) -> dict:
         "cost_usd": cost,
         "summary_uri": uri,
     }
+
+
+# ------------------------------------------------------------- test setup 4: app traffic
+# One attempt per request: a throttled request is counted, not retried away by the SDK.
+ddb_app = boto3.client(
+    "dynamodb",
+    config=Config(retries={"mode": "standard", "total_max_attempts": 1}, max_pool_connections=64, connect_timeout=2, read_timeout=5),
+)
+TRAFFIC_CHUNK_SECONDS = 600
+
+
+def traffic(event, context):
+    remaining = float(event["until"]) - time.time()
+    seconds = max(0.0, min(TRAFFIC_CHUNK_SECONDS, remaining))
+    result = app_traffic.run(ddb_app, cloudwatch, event["table"], int(event["reads"]), int(event["writes"]), seconds) if seconds > 0 else {}
+    result["continue"] = float(event["until"]) - time.time() > 30
+    return result

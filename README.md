@@ -172,6 +172,26 @@ python -m bulkput conflict-check
 
 Run this after both bulk put workflows finish. It reads the latest execution of each one and compares the report counts with the expected totals. It then reads all 100,000 touched keys with `BatchGetItem` and checks the `Version` of each key, group by group. It ends with `Result: matches the plan` or `Result: DOES NOT match the plan`.
 
+### Test setup 4: app traffic during a load
+
+This test checks whether a load affects an application that uses the same table. Run it on new, empty tables, which is right after `cdk deploy`.
+
+```bash
+python -m bulkput generate --count 10000000 --batch catalog-10m --shards 100
+python -m bulkput traffic-start --minutes 180 --reads 200 --writes 50
+# wait at least 10 minutes for the baseline
+python -m bulkput start --batch catalog-10m
+# after all three loads finish
+python -m bulkput traffic-report
+python -m bulkput traffic-stop
+```
+
+- **`traffic-start`** starts the `AppTraffic` workflow once per table. It runs `AppTrafficFunction` in 10-minute chunks until `--minutes` have passed. Each chunk sends `--reads` `GetItem` requests per second to random `sku` keys and `--writes` `PutItem` requests per second to separate `app-` keys. It makes one attempt per request, with no SDK retries, and publishes `AppReadLatency`, `AppWriteLatency`, the request counts, the throttles and the other errors to the `BulkPutDemo` CloudWatch namespace every minute.
+- **`traffic-report`** compares two windows for each table: the baseline, from the traffic start to the load start, and the time that table's load was running. It prints p50 and p99 latency, throttles, other errors and requests.
+- **`traffic-stop`** stops the traffic early. Without it, the traffic stops by itself after `--minutes`.
+
+The p99 latency includes queueing inside the Python Lambda that sends the traffic, so use the p50 latency and the throttle counts to compare windows. The dashboard has two more widgets for this test: the app's write latency, and its throttles per table.
+
 ## 5. Clean up
 
 ```bash
