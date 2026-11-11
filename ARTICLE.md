@@ -1,22 +1,22 @@
 # Amazon DynamoDB Bulk Put Items - A Developer's Take
 
-Loading a large batch of data into a DynamoDB table that is already serving traffic has always needed care. Until now, it meant writing a `BatchWriteItem` loader, or running a Glue or EMR job, and then handling capacity and throttling yourself. Import from S3 doesn't help here, because it only creates new tables ([AWS Database Blog](https://aws.amazon.com/blogs/database/amazon-dynamodb-can-now-import-amazon-s3-data-into-a-new-table/)).
+Loading a large batch of data into a DynamoDB table that is already serving traffic has always needed care. Until now, it meant a `BatchWriteItem` loader or a Glue or EMR job, and handling capacity and throttling yourself. Import from S3 only creates new tables ([AWS Database Blog](https://aws.amazon.com/blogs/database/amazon-dynamodb-can-now-import-amazon-s3-data-into-a-new-table/)).
 
-On November 5, 2026, AWS announced [bulk put items for Amazon DynamoDB](https://aws.amazon.com/about-aws/whats-new/2026/11/amazon-dynamodb-now-supports-bulk-put-items/). You point it at files in S3, and DynamoDB reads them, writes the items into an existing table, and reports what it could not write. This article explains how it works, and shares what we found when we tested it against `BatchWriteItem` with 1 million and 10 million items, with and without app traffic on the table.
+On November 5, 2026, AWS announced [bulk put items for Amazon DynamoDB](https://aws.amazon.com/about-aws/whats-new/2026/11/amazon-dynamodb-now-supports-bulk-put-items/). You point it at files in S3, and DynamoDB writes the items into an existing table and reports what it could not write. This article explains how it works, and what we found when we tested it against `BatchWriteItem` with 1 million and 10 million items, with and without app traffic.
 
-The complete source, a Python app and a CDK stack, is available in the [amazon_dynamodb_bulk_put_items](https://github.com/ssathasivan/amazon_dynamodb_bulk_put_items) repository.
+The complete source, a Python app and a CDK stack, is in the [amazon_dynamodb_bulk_put_items](https://github.com/ssathasivan/amazon_dynamodb_bulk_put_items) repository.
 
 ## How it works
 
-Bulk put items is an asynchronous operation. `StartBulkPutItems` returns an operation ARN straight away, and DynamoDB reads, checks and writes the records in the background. The writes don't use the table's capacity, so they don't compete with your application. The third test checks this with app traffic running during a load.
+Bulk put items is an asynchronous operation. `StartBulkPutItems` returns an operation ARN straight away, and DynamoDB writes the records in the background. The writes don't use the table's capacity, so they don't compete with your application. Our third test checks this.
 
 The input is line-delimited DynamoDB JSON or [Amazon Ion](https://amazon-ion.github.io/ion-docs/), either uncompressed or compressed with gzip or zstd. Each line is one record: the item to write and, optionally, a condition. All files under one S3 prefix must use the same format and compression. The files can also be in a different account from the table.
 
-Every operation runs on one of two performance tiers. Standard is the default, for loads without a deadline, and is in all commercial Regions and AWS GovCloud (US). Accelerated is for loads that must finish fast, is in a subset of Regions, and costs twice as much.
+There are two performance tiers. Standard is the default, for loads without a deadline, and is in all commercial Regions and AWS GovCloud (US). Accelerated is for loads that must finish fast, is in a subset of Regions, and costs twice as much.
 
 ## Conditions
 
-A record's condition decides whether its item is written. It uses `PutItem` syntax and is checked against the item already in the table. These three records come from our second test, where the table already holds all three products at `Version 1` (`payload` is shortened):
+A record's condition uses `PutItem` syntax and is checked against the item already in the table. These three records come from our second test, where the table already holds all three products at `Version 1` (`payload` is shortened):
 
 ```json
 {"Item": {"sku": {"S": "sku-000000005"}, "category": {"S": "cat-05"}, "Version": {"N": "2"}, "title": {"S": "Product 5"}, "payload": {"S": "xxx..."}}}
@@ -24,13 +24,13 @@ A record's condition decides whether its item is written. It uses `PutItem` synt
 {"Item": {"sku": {"S": "sku-000040005"}, "category": {"S": "cat-05"}, "Version": {"N": "2"}, "title": {"S": "Product 40005"}, "payload": {"S": "xxx..."}}, "ConditionExpression": "#v < :v", "ExpressionAttributeNames": {"#v": "Version"}, "ExpressionAttributeValues": {":v": {"N": "2"}}}
 ```
 
-The first line has no condition, so it overwrites the existing item and Product 5 moves to `Version 2`. The second line is written only if the item doesn't exist. Product 20005 exists, so it is skipped. The third line is a version guard. It is written only if its `Version` is higher than the table's, so old data can't replace newer data. Here 2 is higher than 1, so it is written.
+The first line has no condition, so Product 5 is overwritten at `Version 2`. The second is written only if the item doesn't exist, so Product 20005 is skipped. The third is a version guard: it is written only if its `Version` is higher than the table's, so old data can't replace newer data. Here 2 is higher than 1, so it is written.
 
-One thing to watch with the version guard: `#v < :v` on its own also skips new keys, because a missing `Version` can't be compared. To write both new keys and newer versions, AWS uses `attribute_not_exists(#v) OR #v < :v` ([Considerations](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/BulkPutItems.Considerations.html)).
+`#v < :v` on its own also skips new keys, because a missing `Version` can't be compared. To write both new keys and newer versions, AWS uses `attribute_not_exists(#v) OR #v < :v` ([Considerations](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/BulkPutItems.Considerations.html)).
 
 ## Starting a load
 
-One command starts a load. It names the table, the input files and the output location:
+One command starts a load:
 
 ```bash
 aws dynamodb start-bulk-put-items \
@@ -44,19 +44,20 @@ Use `ACCELERATED` for the Accelerated tier. If you pass a client token, a retrie
 
 ## Reports and statuses
 
-DynamoDB writes a manifest to the output location, which says whether each input file was read in full. It also writes up to two reports: `ERROR`, for records with bad data such as a missing key, and `CONDITION_CHECK_FAILURE`, for records skipped because their condition was false. You only get the second one if you ask for it in `OutputType`.
+DynamoDB writes a manifest, which says whether each input file was read in full, and up to two reports: `ERROR`, for records with bad data such as a missing key, and `CONDITION_CHECK_FAILURE`, for records skipped because their condition was false. You only get the second one if you ask for it in `OutputType`.
 
 An operation ends as `COMPLETED`, `COMPLETED_WITH_ERRORS` when some records failed, `CANCELLED` or `FAILED`. `COMPLETED` can still include records skipped by a condition.
 
 ## Sample project
 
-The CDK project loads the same data in three ways, so the only difference is the method. It deploys:
+The CDK project loads the same data in three ways. It deploys:
 
 - an input bucket for the product records, in gzip files
 - an output bucket for the bulk put reports and manifest, plus a summary file for each run
 - three on-demand tables: `BatchWriteTable`, `BulkPutStandardTable` and `BulkPutAcceleratedTable`
 - three Step Functions workflows, one per table, started with the same input
-- a CloudWatch dashboard, `BulkPutComparison`, with items loaded, table capacity used and throttles for all three tables
+- an `AppTraffic` workflow and Lambda that send app traffic to the tables during the third test
+- a CloudWatch dashboard, `BulkPutComparison`, with items loaded, table capacity used and throttles for all three tables, plus the app's write latency and throttles
 
 ### BatchWrite
 
@@ -78,9 +79,9 @@ This workflow writes the items using bulk put items on the Accelerated tier.
 
 ### Why a Lambda starts the load
 
-We wanted Step Functions to call `StartBulkPutItems` directly, but it can't yet. On November 11, 2026, `aws stepfunctions validate-state-machine-definition` in us-east-1 rejected `arn:aws:states:::aws-sdk:dynamodb:startBulkPutItems` with "The resource provided … is not recognized", so a Lambda makes the call. AWS adds SDK integrations over time, so check again before you copy this design.
+Step Functions can't call `StartBulkPutItems` directly yet. On November 11, 2026, `aws stepfunctions validate-state-machine-definition` in us-east-1 rejected `arn:aws:states:::aws-sdk:dynamodb:startBulkPutItems` with "The resource provided … is not recognized", so a Lambda makes the call. AWS adds SDK integrations over time, so check again before you copy this design.
 
-The waiting happens in Step Functions, not in the Lambda. The workflow checks `DescribeBulkOperation` every 30 seconds, instead of one Lambda waiting for many minutes.
+The waiting happens in Step Functions, which checks `DescribeBulkOperation` every 30 seconds, instead of one Lambda waiting for many minutes.
 
 The input is split into equal files with shuffled keys, as AWS recommends ([Best practices](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/BulkPutItems.BestPractices.html)). All three workflows start at the same time on the same files, without conditions in the speed tests because `BatchWriteItem` can't use them, so the method is the only difference.
 
@@ -89,11 +90,11 @@ The input is split into equal files with shuffled keys, as AWS recommends ([Best
 Bulk put items runs with the caller's permissions, so the start Lambda's role has:
 
 - `dynamodb:StartBulkOperation` and `dynamodb:BulkPutItems`, with `BulkPutItems` allowed only on the two bulk put tables
-- `dynamodb:DescribeBulkOperation`, `dynamodb:CancelBulkOperation` and `dynamodb:ListBulkOperations`, without which you can start an operation but not monitor or cancel it
+- `dynamodb:DescribeBulkOperation`, `dynamodb:CancelBulkOperation` and `dynamodb:ListBulkOperations`, to monitor and cancel an operation
 - `s3:GetObject` and `s3:ListBucket` on the input bucket
 - `s3:PutObject` and `s3:AbortMultipartUpload` on the output bucket
 
-The buckets use S3-managed encryption, so the role needs no `kms:` permissions. With a customer managed KMS key on the table or the objects, add `kms:Decrypt` and `kms:GenerateDataKey`. Without `kms:Decrypt`, the start fails with `AccessDeniedException` ([Considerations](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/BulkPutItems.Considerations.html)).
+The buckets use S3-managed encryption, so the role needs no `kms:` permissions. With a customer managed KMS key, add `kms:Decrypt` and `kms:GenerateDataKey`. Without `kms:Decrypt`, the start fails with `AccessDeniedException` ([Considerations](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/BulkPutItems.Considerations.html)).
 
 ### Deploying
 
@@ -115,7 +116,7 @@ The stack bundles a newer boto3, because the Lambda runtime's own boto3 may not 
 
 ## Test 1: 1 million items
 
-The first test loads 1 million products of about 1 KB, in 20 gzip files of 50,000 records, so about 1 GB. The records are plain writes with no condition. We ran it twice: first into the empty tables, then again into the same tables, so every record replaces an existing item.
+The first test loads 1 million products of about 1 KB, in 20 gzip files, so about 1 GB, with no conditions. We ran it twice: into the empty tables, then again into the same tables, so every record replaces an existing item.
 
 This creates the files and uploads them to `s3://<InputBucketName>/batches/catalog-1m/data/`:
 
@@ -130,7 +131,7 @@ This starts all three workflows with the same input. Run it a second time for th
 python -m bulkput start --batch catalog-1m
 ```
 
-This prints the load time, items per second, cost, capacity used and throttles of each workflow's latest run. CloudWatch metrics can lag, so run it again if the capacity looks low:
+This prints each workflow's latest run. CloudWatch metrics can lag, so run it again if the capacity looks low:
 
 ```bash
 python -m bulkput compare
@@ -156,13 +157,13 @@ python -m bulkput compare
 
 Every load wrote all 1 million items. `BatchWriteItem` was 5 times faster in the first run and 7 to 10 times faster in the second, but it used 1 million capacity units and was throttled in both runs. In the table's CloudWatch metrics, both bulk put tables show 0 capacity used and 0 throttles, because bulk writes don't use the table's capacity ([Considerations](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/BulkPutItems.Considerations.html)).
 
-Accelerated was no faster than Standard. The two were about the same in the first run, and Accelerated was slower in the second. AWS recommends Standard for loads under 1 GB ([AWS Database Blog](https://aws.amazon.com/blogs/database/introducing-bulk-put-items-for-amazon-dynamodb-load-data-from-amazon-s3-into-existing-tables-at-scale/)), so we tried 10 GB in the third test.
+Accelerated was no faster than Standard, and slower in the second run. AWS recommends Standard for loads under 1 GB ([AWS Database Blog](https://aws.amazon.com/blogs/database/introducing-bulk-put-items-for-amazon-dynamodb-load-data-from-amazon-s3-into-existing-tables-at-scale/)), so we tried 10 GB in the third test.
 
-Every method was faster the second time. For bulk put items, AWS says the first operations on a table can outpace table scaling ([Performance tiers](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/BulkPutItems.Tiers.html)). `BatchWriteItem` most likely got faster, and was throttled far less, because the on-demand table scaled up after the first run. AWS says on-demand tables handle up to double their previous peak straight away, and can throttle above that ([On-demand capacity mode](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/on-demand-capacity-mode.html)). In the third test, the warm throughput of `BatchWriteTable` grew from 4,000 to 15,668 writes per second after one load.
+Every method was faster the second time. AWS says the first bulk put operations on a table can outpace table scaling ([Performance tiers](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/BulkPutItems.Tiers.html)). `BatchWriteItem` most likely got faster, and was throttled far less, because the on-demand table scaled up. On-demand tables handle up to double their previous peak straight away, and can throttle above that ([On-demand capacity mode](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/on-demand-capacity-mode.html)). In the third test, the warm throughput of `BatchWriteTable` grew from 4,000 to 15,668 writes per second after one load.
 
 ## Test 2: conditions and the report
 
-The second test checks conditions and the report. It runs only the two bulk put workflows, on the tables from the first test, which hold the 1 million products at `Version` 1. The input is 100,010 records in 4 gzip files:
+The second test runs only the two bulk put workflows, on the tables from the first test, which hold the 1 million products at `Version` 1. The input is 100,010 records in 4 gzip files:
 
 | Records | Condition | Expected |
 |---|---|---|
@@ -181,7 +182,7 @@ The README has the commands that reset the tables and upload the 100,010 records
 python -m bulkput start --batch conflict-test --bulk-only
 ```
 
-This compares the report counts with the plan, reads all 100,000 touched keys, and checks each `Version`. It ends with `Result: matches the plan` or `Result: DOES NOT match the plan`:
+This compares the report counts with the plan and checks the `Version` of all 100,000 touched keys:
 
 ```bash
 python -m bulkput conflict-check
@@ -201,15 +202,13 @@ Both loads ended with the status `COMPLETED_WITH_ERRORS`, and both matched the p
 | Files fully processed | 4 of 4 | 4 of 4 |
 | Keys with the expected `Version` | 100,000 of 100,000 | 100,000 of 100,000 |
 
-`DescribeBulkOperation` gave us `ProcessedItemCount` of 100,010, which includes the skipped and failed records, and `FailedItemCount` of 10, which counts only the errors. It has no count for condition failures, so the 40,000 came from the report files.
+`DescribeBulkOperation` gave us `ProcessedItemCount` of 100,010 and `FailedItemCount` of 10. It has no count for condition failures, so the 40,000 came from the report files.
 
-Each report record points back to its source: the input file, the position (`itemIndex`) and the reason, for example "Missing the key sku in the item". Condition failures also carry the item you sent (`newImage`) and the item in the table (`oldImage`). With the position, you can fix the bad records and load only those again. A report file is only written when it has records, so the first test produced only the manifest.
+Each report record has the input file, the position (`itemIndex`) and the reason, for example "Missing the key sku in the item", so you can fix the bad records and load only those again. Condition failures also carry the item you sent (`newImage`) and the item in the table (`oldImage`). A report file is only written when it has records, so the first test produced only the manifest.
 
 ## Test 3: 10 million items
 
-The third test repeats the first at 10 times the size, to see whether Accelerated helps above 1 GB. It also adds app traffic, to see whether a load affects an application that uses the same table. It loads 10 million products, about 1 KB each, in 100 gzip files of 100,000 records, so about 10 GB in total. The records are plain writes again.
-
-We ran the loads three times without app traffic: first into new, empty tables, then twice into the same tables. Then we redeployed for new tables and ran a fourth load with app traffic.
+The third test repeats the first at 10 times the size, 10 million products in 100 gzip files, about 10 GB, to see whether Accelerated helps above 1 GB. We ran it three times: into new tables, then twice into the same tables. Then we redeployed for new tables and ran a fourth load with app traffic, to see whether a load affects an application on the same table.
 
 The app traffic is a Lambda that sends 200 `GetItem` and 50 `PutItem` requests per second to each table, with one attempt per request, so every throttle is counted. The README has the details.
 
@@ -219,14 +218,14 @@ This creates the files and uploads them to `s3://<InputBucketName>/batches/catal
 python -m bulkput generate --count 10000000 --batch catalog-10m --shards 100
 ```
 
-For the runs without app traffic, run this three times, and run `compare` after all three workflows finish each time:
+For the runs without app traffic, run this three times:
 
 ```bash
 python -m bulkput start --batch catalog-10m
 python -m bulkput compare
 ```
 
-For the run with app traffic, start the traffic on new tables and wait 10 minutes for a baseline. Then start the loads, and when they finish, compare the app's traffic in the baseline with its traffic during each load:
+For the run with app traffic, start the traffic on new tables, wait 10 minutes for a baseline, then start the loads. `traffic-report` compares the baseline with each load:
 
 ```bash
 python -m bulkput traffic-start --minutes 180 --reads 200 --writes 50
@@ -251,7 +250,7 @@ Every load wrote all 10 million items.
 | Bulk put, Accelerated | 1,608 / 5,459 / 7,508 | 0 | 0 / 0 / 0 |
 | BatchWriteItem | 5,872 / 15,552 / 30,211 | about 10,000,000 | 1,001,970 / 130,900 / 41,412 |
 
-`BatchWriteItem` was still faster: about 4 times faster than bulk put items in the first and third runs, and about 3 times in the second.
+`BatchWriteItem` was still 3 to 4 times faster.
 
 Accelerated helped only on loads into new tables: about 1.2 times faster in the first run, and about 1.1 times with app traffic. In the second and third runs, the two tiers took about the same time.
 
@@ -268,15 +267,15 @@ Every run was faster than the one before. Standard went from over 2 hours to 23 
 | BulkPutAcceleratedTable | baseline, 10 min | 149,999 | 0 | 0 | 3.4 ms | 5.4 ms | 2.9 / 5.2 ms |
 | BulkPutAcceleratedTable | during Accelerated, 117 min | 1,754,996 | 0 | 0 | 3.2 ms | 4.1 ms | 3.1 / 4.1 ms |
 
-During the `BatchWriteItem` load, about 2% of the app's writes were throttled: 1,787 of about 87,000. DynamoDB's own `ThrottledRequests` metric shows 1,783 for the same window. The app's reads were not throttled. During both bulk put loads, which ran for about 2 hours each, the app had no throttles at all. That is our own evidence for AWS's claim that bulk writes don't compete with your application.
+During the `BatchWriteItem` load, about 2% of the app's writes were throttled: 1,787 of about 87,000, and DynamoDB's `ThrottledRequests` metric shows 1,783. The app's reads were not. During both bulk put loads, about 2 hours each, the app had no throttles at all. That is our own evidence for AWS's claim that bulk writes don't compete with your application.
 
-This was the worst case for `BatchWriteItem`. The tables were new, and new on-demand tables can sustain up to 4,000 writes per second ([On-demand capacity mode](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/on-demand-capacity-mode.html)), while our loader wrote as fast as it could, with adaptive retries. A loader limited to the table's spare capacity would likely throttle the app less, but would take longer. We ran this once, on on-demand tables only.
+This was the worst case for `BatchWriteItem`. New on-demand tables can sustain up to 4,000 writes per second ([On-demand capacity mode](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/on-demand-capacity-mode.html)), and our loader wrote as fast as it could. A loader limited to spare capacity would likely throttle the app less, but take longer. We ran this once, on on-demand tables only.
 
-Latency didn't change in any window. The app's median stayed the same, and so did DynamoDB's p99, between 2.6 and 5.2 ms. That p99 comes from the table's `SuccessfulRequestLatency` metric for `GetItem` and `PutItem`, which covers only the app's requests and excludes network and client time ([Metrics and dimensions](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/metrics-dimensions.html)). The app's own p99 was 120 to 230 ms even in the baseline, so it most likely shows client-side CPU contention in the Lambda that sends the traffic, and we don't use it.
+Latency didn't change in any window, and DynamoDB's p99 stayed between 2.6 and 5.2 ms. That p99 comes from `SuccessfulRequestLatency` for `GetItem` and `PutItem`, which covers only the app's requests and excludes network and client time ([Metrics and dimensions](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/metrics-dimensions.html)). The app's own p99 was 120 to 230 ms even in the baseline, most likely from CPU contention in the Lambda, so we don't use it.
 
-Each load window also had 13 to 53 errors that weren't throttles, at most 0.003% of its requests, and the baselines had none. DynamoDB's `SystemErrors` metric shows the same counts for the same windows, so these were HTTP 500 errors from DynamoDB. They appeared during all three loads, including both bulk put loads, so a load wasn't completely invisible to the app. A client with retries would normally retry them. We don't know the cause.
+Each load window also had 13 to 53 HTTP 500 errors, at most 0.003% of its requests, matching DynamoDB's `SystemErrors` metric. The baselines had none. They appeared during all three loads, including both bulk put loads, so a load wasn't completely invisible to the app. A client with retries would normally retry them. We don't know the cause.
 
-The loads took 2 h 7 min on Standard, 1 h 58 min on Accelerated and 30 min with `BatchWriteItem`, close to the first run without app traffic. `BatchWriteItem` itself was throttled 1,162,742 times. `compare` counts write units from 5 minutes before to 5 minutes after each load. In that window, `BulkPutStandardTable` used 410,624 write units in 137 minutes, while the app wrote 407,855 items. `BulkPutAcceleratedTable` used 383,874 in 128 minutes, while the app wrote 383,969. So those write units are the app's writes, not the load.
+The loads took 2 h 7 min on Standard, 1 h 58 min on Accelerated and 30 min with `BatchWriteItem`, close to the first run without app traffic. `BatchWriteItem` itself was throttled 1,162,742 times. The bulk put tables did show write units this time: 410,624 on Standard and 383,874 on Accelerated, in `compare`'s window of 5 minutes either side of the load. The app wrote 407,855 and 383,969 items in the same windows, so those are the app's writes, not the load.
 
 Test 1 ran twice, test 2 once and test 3 four times, so these results should be treated as directional.
 
@@ -291,7 +290,7 @@ The buckets use `auto_delete_objects` and the tables use `RemovalPolicy.DESTROY`
 
 ## Approximate cost
 
-The following cost is calculated for one run of the third test, and for 100 million items, in us-east-1. The bulk put cost uses the bytes that `DescribeBulkOperation` reported in `BulkOperationUsage`.
+The following cost is for one run of the third test, and for 100 million items, in us-east-1. The bulk put cost uses the bytes in `BulkOperationUsage` from `DescribeBulkOperation`.
 
 Assumptions:
 
@@ -307,13 +306,11 @@ Assumptions:
 | 100 million items, bulk put Standard / Accelerated | about 95.4 GiB × $0.10 / $0.20 | $9.54 / $19.07 |
 | 100 million items, BatchWriteItem, on-demand | 100,000,000 write units ÷ 1,000,000 × $0.625 | $62.50 |
 
-Bulk put items is billed per GB written, not per request unit, so the cost scales with the data.
+Bulk put items bills each item for its actual size, with a 1 KB minimum for the table and each index.
 
-The second test cost about $0.01 on Standard and $0.02 on Accelerated. It paid for all 100,000 valid records, not only the 60,000 written, because condition failures are billed too. The 10 records that failed validation were not billed.
+The second test cost about $0.01 on Standard and $0.02 on Accelerated. Condition failures are billed too, so it paid for all 100,000 valid records, not only the 60,000 written. The 10 invalid records were not billed.
 
-The run with app traffic cost the same as the other 10 million runs for the loads, plus about $2 for the app traffic, not checked against the bill: about 6.5 million eventually consistent reads, 1.6 million writes, and one Lambda function running against three tables at the same time for 3 hours.
-
-Each item is billed for its actual size, with a 1 KB minimum for the table and for each index.
+The app traffic added about $2, not checked against the bill: about 6.5 million eventually consistent reads, 1.6 million writes, and one Lambda function running against three tables at the same time for 3 hours.
 
 To estimate your own load:
 
@@ -326,7 +323,7 @@ Rates for other Regions and for Standard-IA tables are on the [DynamoDB pricing 
 ## Gotchas
 
 - Don't share a client token between tables. We first used the Step Functions execution name as the token for both bulk put workflows, and the second start failed with `IdempotentParameterMismatchException`. The fix was `<workflow name>-<execution name>`.
-- The reports are not next to the manifest. The manifest is in `<operation-id>/`, but the report files are in `<operation-id>-0/`, `<operation-id>-1/` and so on, one per internal job. A listing that ends in `<operation-id>/` finds only the manifest, so drop the trailing slash.
+- The reports are not next to the manifest. The manifest is in `<operation-id>/`, but the report files are in `<operation-id>-0/`, `<operation-id>-1/` and so on. A listing that ends in `<operation-id>/` finds only the manifest, so drop the trailing slash.
 - Ask for `CONDITION_CHECK_FAILURE` whenever your records have conditions. Without it, you have no record or count of skipped items at all.
 - After an internal failover, DynamoDB can write a record a second time. A record with no condition can then overwrite a newer write from your application, so put a version guard on every record.
 
@@ -336,7 +333,7 @@ For the size limits, quotas, table states and unsupported features such as globa
 
 | Pros | Cons |
 |---|---|
-| 0 capacity used and 0 throttles in every run without app traffic, and 0 app throttles during the bulk put loads, against 1,787 during `BatchWriteItem` | 3 to 10 times slower than `BatchWriteItem` in tests 1 and 3 |
+| 0 throttles on the bulk put tables, and 0 app throttles during the bulk put loads against 1,787 during `BatchWriteItem` | 3 to 10 times slower than `BatchWriteItem` in tests 1 and 3 |
 | Conditions per record, which skipped exactly the 40,000 records they should have | Accelerated was faster only on the 10 GB loads into new tables and in the small second test, at twice the price |
 | A report with each failed record's file and position | The first 10 million-item load took about 2 hours on Standard, against 23 to 30 minutes later |
 | About 6.5 times cheaper than on-demand writes on Standard | No condition-failure count, and reports split across folders |
@@ -344,7 +341,7 @@ For the size limits, quotas, table states and unsupported features such as globa
 
 ## Conclusion
 
-Bulk put items loaded our tables with zero throttles and checked every record's condition, which a `BatchWriteItem` loader can't do. With app traffic on the table, the app saw no throttles during the bulk put loads, while about 2% of its writes were throttled during the `BatchWriteItem` load. Bulk put items was also slower than `BatchWriteItem` in every test where we compared them, and Accelerated rarely earned its double price.
+Bulk put items loaded our tables with zero throttles and checked every record's condition, which a `BatchWriteItem` loader can't do. Our app saw no throttles during the bulk put loads, against 2% of its writes during the `BatchWriteItem` load. Bulk put items was also slower than `BatchWriteItem` in every test where we compared them, and Accelerated rarely earned its double price.
 
 Worth trying, but start with Standard and measure it on your own data before you commit to it.
 
