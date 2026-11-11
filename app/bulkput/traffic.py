@@ -38,21 +38,25 @@ class _Window:
     def reset(self) -> None:
         self.latency = {"read": Counter(), "write": Counter()}
         self.counts = Counter()
+        self.error_types = Counter()  # (kind, error code or exception class) -> count
 
     def ok(self, kind: str, ms: float) -> None:
         with self.lock:
             self.latency[kind][round(ms, 1)] += 1
             self.counts[f"{kind}_ok"] += 1
 
-    def fail(self, kind: str, throttled: bool) -> None:
+    def fail(self, kind: str, error_type: str) -> None:
+        throttled = error_type in THROTTLE_CODES
         with self.lock:
             self.counts[f"{kind}_{'throttle' if throttled else 'error'}"] += 1
+            if not throttled:
+                self.error_types[(kind, error_type)] += 1
 
-    def take(self) -> tuple[dict, Counter]:
+    def take(self) -> tuple[dict, Counter, Counter]:
         with self.lock:
-            latency, counts = self.latency, self.counts
+            latency, counts, error_types = self.latency, self.counts, self.error_types
             self.reset()
-        return latency, counts
+        return latency, counts, error_types
 
 
 def _values_counts(hist: Counter) -> tuple[list[float], list[float]]:
@@ -68,7 +72,7 @@ def _values_counts(hist: Counter) -> tuple[list[float], list[float]]:
     return [v for v, _ in items], [float(c) for _, c in items]
 
 
-def _publish(cloudwatch, table: str, latency: dict, counts: Counter, when: datetime) -> None:
+def _publish(cloudwatch, table: str, latency: dict, counts: Counter, error_types: Counter, when: datetime) -> None:
     dims = [{"Name": "Table", "Value": table}]
     data = []
     for kind, name in (("read", "AppReadLatency"), ("write", "AppWriteLatency")):
@@ -81,7 +85,12 @@ def _publish(cloudwatch, table: str, latency: dict, counts: Counter, when: datet
         ("read_error", "AppReadErrors"), ("write_error", "AppWriteErrors"),
     ):
         data.append({"MetricName": name, "Dimensions": dims, "Timestamp": when, "Value": float(counts.get(key, 0)), "Unit": "Count"})
-    cloudwatch.put_metric_data(Namespace=NAMESPACE, MetricData=data)
+    # Non-throttle errors split by type, for example InternalServerError or ReadTimeoutError.
+    for (kind, error_type), n in error_types.items():
+        type_dims = dims + [{"Name": "Operation", "Value": "GetItem" if kind == "read" else "PutItem"}, {"Name": "ErrorType", "Value": error_type[:250]}]
+        data.append({"MetricName": "AppErrorsByType", "Dimensions": type_dims, "Timestamp": when, "Value": float(n), "Unit": "Count"})
+    for i in range(0, len(data), 1000):  # PutMetricData takes up to 1,000 metrics per call
+        cloudwatch.put_metric_data(Namespace=NAMESPACE, MetricData=data[i : i + 1000])
 
 
 def run(ddb, cloudwatch, table: str, reads: int, writes: int, seconds: float, payload_bytes: int = 900) -> dict:
@@ -99,9 +108,9 @@ def run(ddb, cloudwatch, table: str, reads: int, writes: int, seconds: float, pa
             ddb.get_item(TableName=table, Key={"sku": {"S": key}})
             window.ok("read", (time.perf_counter() - t0) * 1000)
         except ClientError as e:
-            window.fail("read", e.response["Error"]["Code"] in THROTTLE_CODES)
-        except Exception:  # noqa: BLE001 - count connection errors too, never stop the generator
-            window.fail("read", False)
+            window.fail("read", e.response["Error"]["Code"])
+        except Exception as e:  # noqa: BLE001 - count connection errors too, never stop the generator
+            window.fail("read", type(e).__name__)
 
     def put() -> None:
         item = {
@@ -114,9 +123,9 @@ def run(ddb, cloudwatch, table: str, reads: int, writes: int, seconds: float, pa
             ddb.put_item(TableName=table, Item=item)
             window.ok("write", (time.perf_counter() - t0) * 1000)
         except ClientError as e:
-            window.fail("write", e.response["Error"]["Code"] in THROTTLE_CODES)
-        except Exception:  # noqa: BLE001
-            window.fail("write", False)
+            window.fail("write", e.response["Error"]["Code"])
+        except Exception as e:  # noqa: BLE001
+            window.fail("write", type(e).__name__)
 
     # Spread the requests evenly over each second: `reads` gets and `writes` puts, interleaved.
     rate = reads + writes
@@ -130,9 +139,11 @@ def run(ddb, cloudwatch, table: str, reads: int, writes: int, seconds: float, pa
         while True:
             now = time.monotonic()
             if now >= next_publish or now - start >= seconds:
-                latency, counts = window.take()
+                latency, counts, error_types = window.take()
                 totals.update(counts)
-                _publish(cloudwatch, table, latency, counts, datetime.now(timezone.utc))
+                for (kind, error_type), n in error_types.items():
+                    totals[f"{kind}_error_{error_type}"] += n
+                _publish(cloudwatch, table, latency, counts, error_types, datetime.now(timezone.utc))
                 minutes += 1
                 next_publish += 60
                 if now - start >= seconds:

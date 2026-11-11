@@ -237,13 +237,51 @@ def cmd_traffic_stop(args) -> None:
         print("No app traffic running.")
 
 
-def _app_stats(cw, table: str, start: datetime, end: datetime) -> dict:
-    """One CloudWatch period that covers [start, end): percentiles from the Values/Counts data."""
+def _window(start: datetime, end: datetime) -> tuple[datetime, datetime, int] | None:
+    """Whole minutes inside [start, end), skipping the partial first minute. Returns (start, end, period)."""
     start = (start + timedelta(minutes=1)).replace(second=0, microsecond=0)
     period = int((end - start).total_seconds()) // 60 * 60
     if period < 60:
+        return None
+    return start, start + timedelta(seconds=period), period
+
+
+def _server_stats(cw, table: str, start: datetime, end: datetime) -> dict:
+    """DynamoDB's own view of the app's GetItem and PutItem requests in the same window.
+
+    SuccessfulRequestLatency covers only activity inside DynamoDB (no network or client time).
+    The loads use BatchWriteItem or bulk put items, so the GetItem/PutItem dimensions are the app's
+    requests only.
+    """
+    w = _window(start, end)
+    if not w:
         return {}
-    end = start + timedelta(seconds=period)
+    start, end, period = w
+    out: dict = {}
+    for op, key in (("GetItem", "read"), ("PutItem", "write")):
+        dims = [{"Name": "TableName", "Value": table}, {"Name": "Operation", "Value": op}]
+        pts = cw.get_metric_statistics(
+            Namespace="AWS/DynamoDB", MetricName="SuccessfulRequestLatency", Dimensions=dims,
+            StartTime=start, EndTime=end, Period=period, ExtendedStatistics=["p50", "p99"],
+        )["Datapoints"]
+        if pts:
+            out[f"server_{key}_p50"] = pts[0]["ExtendedStatistics"]["p50"]
+            out[f"server_{key}_p99"] = pts[0]["ExtendedStatistics"]["p99"]
+        for metric in ("ThrottledRequests", "SystemErrors"):
+            pts = cw.get_metric_statistics(
+                Namespace="AWS/DynamoDB", MetricName=metric, Dimensions=dims,
+                StartTime=start, EndTime=end, Period=period, Statistics=["Sum"],
+            )["Datapoints"]
+            out[f"server_{key}_{metric}"] = int(sum(p["Sum"] for p in pts))
+    return out
+
+
+def _app_stats(cw, table: str, start: datetime, end: datetime) -> dict:
+    """One CloudWatch period that covers [start, end): percentiles from the Values/Counts data."""
+    w = _window(start, end)
+    if not w:
+        return {}
+    start, end, period = w
     dims = [{"Name": "Table", "Value": table}]
     out = {"minutes": period // 60}
     for name, key in (("AppReadLatency", "read"), ("AppWriteLatency", "write")):
@@ -287,12 +325,22 @@ def cmd_traffic_report(args) -> None:
     if not loads:
         print("No load has started since the traffic started.")
         return
+    print_traffic_report(cw, traffic_start, loads)
+
+
+def print_traffic_report(cw, traffic_start: datetime, loads: dict) -> None:
+    """loads: {table: (label, load_start, load_stop, status)}. Works after the stack is deleted,
+    because CloudWatch keeps 1-minute data for 15 days."""
     load_start = min(v[1] for v in loads.values())
 
     def ms(row, key):
         return f"{row[key]:.1f}" if key in row else "-"
 
-    header = ["Table", "Window", "Minutes", "Read p50", "Read p99", "Write p50", "Write p99", "Read throttles", "Write throttles", "Errors", "Requests"]
+    header = [
+        "Table", "Window", "Minutes", "Read p50", "Read p99", "Write p50", "Write p99",
+        "Srv read p50", "Srv read p99", "Srv write p50", "Srv write p99",
+        "Read throttles", "Write throttles", "Srv throttles", "Errors", "Srv errors", "Requests",
+    ]
     rows = []
     for table in ALL_TABLES:
         windows = [("baseline", traffic_start + timedelta(minutes=1), load_start)]
@@ -303,18 +351,25 @@ def cmd_traffic_report(args) -> None:
             s = _app_stats(cw, table, start, end)
             if not s:
                 continue
+            srv = _server_stats(cw, table, start, end)
             ok = s["AppReads"] + s["AppWrites"]
             errors = s["AppReadErrors"] + s["AppWriteErrors"]
             rows.append([
                 table, wname, str(s["minutes"]), ms(s, "read_p50"), ms(s, "read_p99"), ms(s, "write_p50"), ms(s, "write_p99"),
-                f"{s['AppReadThrottles']:,}", f"{s['AppWriteThrottles']:,}", f"{errors:,}",
+                ms(srv, "server_read_p50"), ms(srv, "server_read_p99"), ms(srv, "server_write_p50"), ms(srv, "server_write_p99"),
+                f"{s['AppReadThrottles']:,}", f"{s['AppWriteThrottles']:,}",
+                f"{srv.get('server_read_ThrottledRequests', 0) + srv.get('server_write_ThrottledRequests', 0):,}",
+                f"{errors:,}",
+                f"{srv.get('server_read_SystemErrors', 0) + srv.get('server_write_SystemErrors', 0):,}",
                 f"{ok + errors + s['AppReadThrottles'] + s['AppWriteThrottles']:,}",
             ])
     width = [max(len(h), *(len(r[i]) for r in rows)) for i, h in enumerate(header)]
     print("  ".join(h.ljust(width[i]) for i, h in enumerate(header)))
     for r in rows:
         print("  ".join(c.ljust(width[i]) for i, c in enumerate(r)))
-    print("\nLatency in milliseconds, measured by the client, one attempt per request (no SDK retries).")
+    print("\nRead/Write p50 and p99: milliseconds measured by the client, one attempt per request (no SDK retries).")
+    print("Srv columns: AWS/DynamoDB SuccessfulRequestLatency, ThrottledRequests and SystemErrors for GetItem and PutItem,")
+    print("which DynamoDB measures without network or client time.")
     for table, (label, start, stop, status) in loads.items():
         print(f"{label}: {status}, {start.astimezone(timezone.utc):%H:%M:%S} to {stop.astimezone(timezone.utc):%H:%M:%S} UTC")
 

@@ -190,7 +190,7 @@ python -m bulkput traffic-stop
 - **`traffic-report`** compares two windows for each table: the baseline, from the traffic start to the load start, and the time that table's load was running. It prints p50 and p99 latency, throttles, other errors and requests.
 - **`traffic-stop`** stops the traffic early. Without it, the traffic stops by itself after `--minutes`.
 
-The p99 latency includes queueing inside the Python Lambda that sends the traffic, so use the p50 latency and the throttle counts to compare windows. The dashboard has two more widgets for this test: the app's write latency, and its throttles per table.
+The client's p99 latency most likely reflects client-side CPU contention in the Lambda that sends the traffic (48 threads at 250 requests per second on 1,024 MB), so compare windows with the p50, the throttles, and the `Srv` columns. `traffic-report` reads the `Srv` columns from `AWS/DynamoDB` for the app's `GetItem` and `PutItem` requests: `SuccessfulRequestLatency` p50 and p99, which exclude network and client time, plus `ThrottledRequests` and `SystemErrors`. Non-throttle errors are also published by type as `AppErrorsByType`, with `Operation` and `ErrorType` dimensions. The dashboard has two more widgets for this test: the app's write latency, and its throttles per table.
 
 ## 5. Clean up
 
