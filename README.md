@@ -205,7 +205,7 @@ Buckets use `auto_delete_objects` and tables use `RemovalPolicy.DESTROY`, so one
 
 - **The caller is `StartFunction`'s role.** Bulk put items uses the caller's credentials to read S3 and write reports. `BulkCallerPolicy` gives that role the five bulk actions (`BulkPutItems` only on the two bulk put tables), read access to the input bucket, and write access to the output bucket.
 - **Manual start.** All three workflows get the same input and start at the same time, so the only difference is the method.
-- **`ClientToken` = `<workflow name>-<execution name>`.** A retried start returns the existing operation instead of starting a second one. The token can't be shared between tables. When both bulk put workflows used the same execution name as the token, DynamoDB rejected the second start with `IdempotentParameterMismatchException`.
+- **`ClientToken` = `<workflow name>-<execution name>`.** If a start is repeated with the same token and the same parameters within 8 hours, DynamoDB returns the existing operation instead of starting a second one. Reusing a token with different parameters fails with `IdempotentParameterMismatchException`. This is why the token can't be shared between tables: when both bulk put workflows used the same execution name as the token, DynamoDB rejected the second start.
 - **One operation per table.** The start step retries `ResourceInUseException` with backoff, so a second run on the same table waits.
 - **Bulk writes don't show in table metrics.** `CheckFunction` publishes `BulkPutDemo/ItemsProcessed` so the dashboard can show bulk put progress.
 - **Reports are streamed and counted.** Report files sit in folders named `<operation-id>-0`, `<operation-id>-1`, and so on, so the code lists them without a trailing slash.
