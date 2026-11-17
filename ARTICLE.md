@@ -14,8 +14,8 @@ The input is line-delimited DynamoDB JSON or [Amazon Ion](https://amazon-ion.git
 
 There are two performance tiers:
 
-- Standard is the default, for loads without a deadline, and is in all commercial regions and AWS GovCloud (US).
-- Accelerated is for loads that must finish fast, is in [selected regions](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/BulkPutItems.Tiers.html#BulkPutItems.Tiers.Accelerated), and costs twice as much.
+- Standard is the default, for loads without a deadline, and is in all commercial Regions and AWS GovCloud (US).
+- Accelerated is for loads that must finish fast, is in [selected Regions](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/BulkPutItems.Tiers.html#BulkPutItems.Tiers.Accelerated), and costs twice as much.
 
 ## Conditions
 
@@ -50,7 +50,7 @@ aws dynamodb start-bulk-put-items \
 
 Use `ACCELERATED` for the Accelerated tier.
 
-The caller can pass an optional `--client-token`. If it doesn't, AWS creates one automatically.
+The caller can pass an optional `--client-token`. If it doesn't, the AWS SDK or CLI generates one.
 
 If you retry with the same token and parameters within 8 hours, DynamoDB returns the original load instead of starting a second one. Use a new token for each new load. A reused token with the same parameters returns the old load without an error.
 
@@ -114,7 +114,7 @@ The buckets use S3-managed encryption, so the role needs no `kms:` permissions. 
 
 ### Deploying
 
-You need AWS credentials in your shell, Python 3.10 or later, Node.js and the CDK CLI (`npm i -g aws-cdk@latest`). Use a region that has the Accelerated tier. We ran everything in us-east-1.
+You need AWS credentials in your shell, Python 3.10 or later, Node.js and the CDK CLI (`npm i -g aws-cdk@latest`). Use a Region that has the Accelerated tier. We ran everything in us-east-1.
 
 ```bash
 git clone https://github.com/ssathasivan/amazon_dynamodb_bulk_put_items.git
@@ -124,7 +124,7 @@ source .venv/bin/activate
 pip install -r infra/requirements.txt -r app/requirements.txt
 
 cd infra
-cdk bootstrap                        # once per account and region
+cdk bootstrap                        # once per account and Region
 cdk deploy
 ```
 
@@ -184,7 +184,7 @@ In this run, the app sent traffic to all three tables throughout. We started it 
 
 ![App write throttles during the loads](https://raw.githubusercontent.com/ssathasivan/amazon_dynamodb_bulk_put_items/main/AppTrafficThrottles.png)
 
-During the `BatchWriteItem` load, about 2% of the app's writes were throttled. During the bulk put loads, none were, which matches AWS's claim that bulk writes don't compete with your application. This was the worst case for `BatchWriteItem`, because our loader wrote as fast as it could. A loader that left spare capacity would throttle the app less, but take longer.
+During the `BatchWriteItem` load, about 2% of the app's writes were throttled. During the bulk put loads, none were, which matches AWS's claim that bulk writes don't compete with your application. This was the worst case for `BatchWriteItem`, because our loader wrote as fast as it could, and new on-demand tables can sustain up to 4,000 writes per second ([On-demand capacity mode](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/on-demand-capacity-mode.html)). A loader that left spare capacity would throttle the app less, but take longer.
 
 Latency didn't change. DynamoDB's p99 latency for the app's requests stayed between 2.6 and 5.2 ms throughout, from the `SuccessfulRequestLatency` metric ([Metrics and dimensions](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/metrics-dimensions.html)).
 
@@ -214,7 +214,7 @@ Bulk put items is cheaper than `BatchWriteItem` on an on-demand table. The 10 mi
 
 Bulk put charges by item size, and items smaller than 1 KB are charged as 1 KB. Each index on the table is charged separately.
 
-If your table uses provisioned capacity, these numbers don't apply. `BatchWriteItem` writes into capacity you already pay for. Prices for other regions are on the [DynamoDB pricing page](https://aws.amazon.com/dynamodb/pricing/).
+If your table uses provisioned capacity, these numbers don't apply. `BatchWriteItem` writes into capacity you already pay for. Prices for other Regions are on the [DynamoDB pricing page](https://aws.amazon.com/dynamodb/pricing/).
 
 ## Gotchas
 
